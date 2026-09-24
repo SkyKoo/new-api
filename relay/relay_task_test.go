@@ -1,8 +1,10 @@
 package relay
 
 import (
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -402,6 +404,53 @@ func TestSharedTaskBillingExpressionSelectionAndFrozenSettlement(t *testing.T) {
 			assert.Equal(t, float64(2), info.TieredBillingSnapshot.UsageFacts[field])
 			assert.Equal(t, 2*info.TieredBillingSnapshot.EstimatedQuotaAfterGroup, result.ActualQuotaAfterGroup)
 			assert.Equal(t, tc.wantExpr, info.TieredBillingSnapshot.ExprString)
+		})
+	}
+}
+
+func TestRelayTaskSubmitAcceptsUpstream2xx(t *testing.T) {
+	saveBillingConfig(t)
+	saved, err := common.Marshal(ratio_setting.GetModelPriceCopy())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(string(saved))) })
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"declared-model":0}`))
+	source := strings.Replace(mappingOrderSubmitPlugin, `export function parseSubmitResponse(){return {taskId:"1"};}`, `export function parseSubmitResponse(ctx, response){ if (!response.body.id) throw new Error("missing upstream task id"); return {taskId:response.body.id,taskData:{status:response.statusCode}}; }`, 1)
+	for _, status := range []int{200, 201, 202, 204, 400, 401, 429, 500} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(status)
+				if status != 204 {
+					_, _ = w.Write([]byte(`{"id":"accepted-upstream","status":"queued"}`))
+				}
+			}))
+			defer server.Close()
+			c, info := newTaskSubmitContext(t, "declared-model", "")
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, server.URL)
+			c.Set("group", "default")
+			info.UserGroup = "default"
+			info.UsingGroup = "default"
+			info.OriginModelName = "declared-model"
+			// The controller already reserved billing; this test exercises upstream HTTP handling.
+			info.Billing = &service.BillingSession{}
+			pinMappingOrderPlugin(t, c, source)
+			result, taskErr := RelayTaskSubmit(c, info)
+			if status >= 400 {
+				require.NotNil(t, taskErr)
+				assert.Equal(t, status, taskErr.StatusCode)
+				assert.Equal(t, "fail_to_fetch_task", taskErr.Code)
+				assert.Nil(t, result)
+			} else if status == 204 {
+				require.NotNil(t, taskErr, "empty 2xx must still fail plugin parsing")
+				assert.Nil(t, result)
+			} else {
+				require.Nil(t, taskErr, "status=%d error=%+v", status, taskErr)
+				require.NotNil(t, result)
+				assert.Equal(t, "accepted-upstream", result.UpstreamTaskID)
+				var data map[string]any
+				require.NoError(t, common.Unmarshal(result.TaskData, &data))
+				assert.Equal(t, float64(status), data["status"])
+			}
 		})
 	}
 }
