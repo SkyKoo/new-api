@@ -1,7 +1,6 @@
 package relay
 
 import (
-	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -408,49 +407,76 @@ func TestSharedTaskBillingExpressionSelectionAndFrozenSettlement(t *testing.T) {
 	}
 }
 
-func TestRelayTaskSubmitAcceptsUpstream2xx(t *testing.T) {
-	saveBillingConfig(t)
-	saved, err := common.Marshal(ratio_setting.GetModelPriceCopy())
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(string(saved))) })
-	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"declared-model":0}`))
-	source := strings.Replace(mappingOrderSubmitPlugin, `export function parseSubmitResponse(){return {taskId:"1"};}`, `export function parseSubmitResponse(ctx, response){ if (!response.body.id) throw new Error("missing upstream task id"); return {taskId:response.body.id,taskData:{status:response.statusCode}}; }`, 1)
-	for _, status := range []int{200, 201, 202, 204, 400, 401, 429, 500} {
-		t.Run(strconv.Itoa(status), func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// Issue #7478: task APIs answer 201 Created or 202 Accepted on submission.
+// Every 2xx must reach parseSubmitResponse; only other statuses are upstream
+// failures that keep the upstream status and body.
+func TestRelayTaskSubmitAcceptsAnySuccessfulUpstreamStatus(t *testing.T) {
+	service.InitHttpClient()
+	const source = `
+export const meta = {apiVersion:1,key:"status-echo",name:"Status Echo",version:"1.0.0",author:{name:"Test"},models:["declared-model"],fetchMode:"per_task"};
+export function buildSubmitRequest(ctx) { return {url: ctx.baseUrl+"/submit", method:"POST", body:{model: ctx.model}, action:"text_to_video"}; }
+export function parseSubmitResponse(ctx, response) { if (!response.body || !response.body.id) throw new Error("missing upstream task id"); return {taskId: response.body.id, taskData: {status: response.statusCode}}; }
+export function buildQueryRequest(ctx) { return {url: ctx.baseUrl+"/query"}; }
+export function parseTaskResult() { return {status:"SUCCESS"}; }
+`
+	for _, tc := range []struct {
+		status         int
+		wantCode       string
+		wantParseError bool
+	}{
+		{status: http.StatusOK},
+		{status: http.StatusCreated},
+		{status: http.StatusAccepted},
+		{status: http.StatusNoContent, wantParseError: true},
+		{status: http.StatusBadRequest, wantCode: "fail_to_fetch_task"},
+		{status: http.StatusUnauthorized, wantCode: "fail_to_fetch_task"},
+		{status: http.StatusTooManyRequests, wantCode: "fail_to_fetch_task"},
+		{status: http.StatusInternalServerError, wantCode: "fail_to_fetch_task"},
+		{status: http.StatusBadGateway, wantCode: "fail_to_fetch_task"},
+	} {
+		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
+			saveBillingConfig(t)
+			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+				"billing_setting.billing_mode": `{"declared-model":"tiered_expr"}`,
+				"billing_setting.billing_expr": `{"declared-model":"tier(\"flat\", 3)"}`,
+			}))
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(status)
-				if status != 204 {
-					_, _ = w.Write([]byte(`{"id":"accepted-upstream","status":"queued"}`))
+				w.WriteHeader(tc.status)
+				if tc.status != http.StatusNoContent {
+					_, _ = w.Write([]byte(`{"id":"job-42","message":"upstream body"}`))
 				}
 			}))
 			defer server.Close()
+
 			c, info := newTaskSubmitContext(t, "declared-model", "")
 			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, server.URL)
 			c.Set("group", "default")
-			info.UserGroup = "default"
-			info.UsingGroup = "default"
+			info.UserGroup, info.UsingGroup = "default", "default"
 			info.OriginModelName = "declared-model"
-			// The controller already reserved billing; this test exercises upstream HTTP handling.
-			info.Billing = &service.BillingSession{}
+			// An existing reservation skips pre-consume so the fixture reaches the upstream call.
+			info.Billing = &imageReservation{limit: 1 << 30}
 			pinMappingOrderPlugin(t, c, source)
+
 			result, taskErr := RelayTaskSubmit(c, info)
-			if status >= 400 {
-				require.NotNil(t, taskErr)
-				assert.Equal(t, status, taskErr.StatusCode)
-				assert.Equal(t, "fail_to_fetch_task", taskErr.Code)
+			if tc.wantParseError {
+				require.NotNil(t, taskErr, "an empty 2xx cannot supply a valid task id")
+				assert.NotEqual(t, "fail_to_fetch_task", taskErr.Code, "2xx must reach response parsing")
 				assert.Nil(t, result)
-			} else if status == 204 {
-				require.NotNil(t, taskErr, "empty 2xx must still fail plugin parsing")
-				assert.Nil(t, result)
-			} else {
-				require.Nil(t, taskErr, "status=%d error=%+v", status, taskErr)
-				require.NotNil(t, result)
-				assert.Equal(t, "accepted-upstream", result.UpstreamTaskID)
-				var data map[string]any
-				require.NoError(t, common.Unmarshal(result.TaskData, &data))
-				assert.Equal(t, float64(status), data["status"])
+				return
 			}
+			if tc.wantCode != "" {
+				require.NotNil(t, taskErr)
+				assert.Equal(t, tc.wantCode, taskErr.Code)
+				assert.Equal(t, tc.status, taskErr.StatusCode)
+				assert.Contains(t, taskErr.Message, "upstream body")
+				assert.Nil(t, result)
+				return
+			}
+			require.Nil(t, taskErr, "submission error: %+v", taskErr)
+			require.NotNil(t, result)
+			assert.Equal(t, "job-42", result.UpstreamTaskID)
+			assert.JSONEq(t, `{"status":`+strconv.Itoa(tc.status)+`}`, string(result.TaskData))
 		})
 	}
 }
