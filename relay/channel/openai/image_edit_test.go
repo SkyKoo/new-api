@@ -13,6 +13,7 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -95,4 +96,41 @@ func TestConvertImageEditRequestMultipart(t *testing.T) {
 
 		convertAndReplay(t, c, prompt)
 	})
+}
+
+// Exercise the JSON decode/copy/convert/encode path used by ImageHelper. Unknown
+// fields are intentionally discarded, so GIF controls must be declared fields.
+func TestConvertImageGenerationAnimationOptions(t *testing.T) {
+	for _, tc := range []struct{ name, fields, want string }{
+		{"custom", `,"output_format":"gif","frame_count":6,"frame_duration_ms":125`, `{"output_format":"gif","frame_count":6,"frame_duration_ms":125}`},
+		{"explicit zero reaches upstream validation", `,"frame_count":0,"frame_duration_ms":0`, `{"frame_count":0,"frame_duration_ms":0}`},
+		{"omitted", ``, `{}`},
+		{"null uses upstream defaults", `,"frame_count":null,"frame_duration_ms":null`, `{}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var request dto.ImageRequest
+			require.NoError(t, common.UnmarshalJsonStr(`{"model":"gpt-image-2.6-sunburst","prompt":"bouncing ball"`+tc.fields+`}`, &request))
+			copied, err := common.DeepCopy(&request)
+			require.NoError(t, err)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			info := &relaycommon.RelayInfo{RelayMode: relayconstant.RelayModeImagesGenerations}
+			converted, err := (&Adaptor{}).ConvertImageRequest(c, info, *copied)
+			require.NoError(t, err)
+			raw, err := common.Marshal(converted)
+			require.NoError(t, err)
+			var fields map[string]any
+			require.NoError(t, common.Unmarshal(raw, &fields))
+			assert.Equal(t, "gpt-image-2.6-sunburst", fields["model"])
+			assert.Equal(t, "bouncing ball", fields["prompt"])
+			delete(fields, "model")
+			delete(fields, "prompt")
+			raw, err = common.Marshal(fields)
+			require.NoError(t, err)
+			assert.JSONEq(t, tc.want, string(raw))
+		})
+	}
+	for _, fields := range []string{`"frame_count":"6"`, `"frame_count":2.5`, `"frame_duration_ms":true`, `"frame_duration_ms":20.5`} {
+		var request dto.ImageRequest
+		assert.Error(t, common.UnmarshalJsonStr(`{`+fields+`}`, &request))
+	}
 }
